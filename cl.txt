@@ -1,0 +1,512 @@
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const NodeCache = require('node-cache');
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Cache configuration (1 hour TTL)
+const cache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
+
+// GitHub API configuration
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_API = 'https://api.github.com';
+
+if (!GITHUB_TOKEN) {
+    console.error('❌ GITHUB_TOKEN not found in environment variables');
+    console.log('Please create a .env file with your GitHub token:');
+    console.log('GITHUB_TOKEN=your_personal_access_token_here');
+    console.log('\nHow to get a GitHub token:');
+    console.log('1. Go to https://github.com/settings/tokens');
+    console.log('2. Click "Generate new token" → "Generate new token (classic)"');
+    console.log('3. Give it a name like "GitHub Analyzer"');
+    console.log('4. Select scopes: "public_repo" and "read:user"');
+    console.log('5. Click "Generate token" and copy it to your .env file');
+    process.exit(1);
+}
+
+const githubApi = axios.create({
+    baseURL: GITHUB_API,
+    headers: {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'GitHubProgressAnalyzer/2.0',
+        'X-GitHub-Api-Version': '2022-11-28'
+    },
+    timeout: 15000 // Increased timeout for better reliability
+});
+
+// GraphQL query for efficient data fetching
+const GRAPHQL_QUERY = `
+  query($username: String!, $first: Int!, $after: String) {
+    user(login: $username) {
+      repositories(first: $first, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
+        totalCount
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          name
+          description
+          createdAt
+          updatedAt
+          stargazerCount
+          forkCount
+          isFork
+          isPrivate
+          primaryLanguage {
+            name
+          }
+          languages(first: 10) {
+            edges {
+              size
+              node {
+                name
+              }
+            }
+          }
+          repositoryTopics(first: 10) {
+            nodes {
+              topic {
+                name
+              }
+            }
+          }
+          defaultBranchRef {
+            target {
+              ... on Commit {
+                history {
+                  totalCount
+                }
+              }
+            }
+          }
+          diskUsage
+          url
+        }
+      }
+      login
+      name
+      bio
+      location
+      company
+      websiteUrl
+      followers {
+        totalCount
+      }
+      following {
+        totalCount
+      }
+      createdAt
+      avatarUrl
+    }
+  }
+`;
+
+// Rate limiter
+class RateLimiter {
+    constructor(maxRequests = 30, windowMs = 60000) {
+        this.requests = [];
+        this.maxRequests = maxRequests;
+        this.windowMs = windowMs;
+    }
+
+    async waitIfNeeded() {
+        const now = Date.now();
+        this.requests = this.requests.filter(time => now - time < this.windowMs);
+
+        if (this.requests.length >= this.maxRequests) {
+            const oldestRequest = Math.min(...this.requests);
+            const waitTime = this.windowMs - (now - oldestRequest) + 100;
+            console.log(`⏳ Rate limiting: waiting ${waitTime}ms`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+
+        this.requests.push(now);
+    }
+}
+
+const rateLimiter = new RateLimiter();
+
+// GraphQL-based repository fetcher with better error handling
+async function getUserReposGraphQL(username, maxRepos = 100) {
+    const cacheKey = `repos_${username}_${maxRepos}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        console.log(`📦 Cache hit for ${username}`);
+        return cached;
+    }
+
+    try {
+        console.log(`🔍 Fetching data for ${username}...`);
+        
+        // First, verify the user exists
+        try {
+            await githubApi.get(`/users/${username}`);
+        } catch (error) {
+            if (error.response?.status === 404) {
+                throw new Error(`User '${username}' not found on GitHub`);
+            }
+            if (error.response?.status === 401) {
+                throw new Error('GitHub API authentication failed. Please check your token.');
+            }
+            throw error;
+        }
+
+        let allRepos = [];
+        let hasNextPage = true;
+        let after = null;
+        const batchSize = Math.min(maxRepos, 50);
+
+        while (hasNextPage && allRepos.length < maxRepos) {
+            await rateLimiter.waitIfNeeded();
+
+            console.log(`📊 Fetching batch ${Math.floor(allRepos.length / batchSize) + 1}...`);
+
+            const response = await githubApi.post('/graphql', {
+                query: GRAPHQL_QUERY,
+                variables: {
+                    username,
+                    first: Math.min(batchSize, maxRepos - allRepos.length),
+                    after
+                }
+            });
+
+            if (response.data.errors) {
+                const error = response.data.errors[0];
+                if (error.type === 'NOT_FOUND') {
+                    throw new Error(`User '${username}' not found on GitHub`);
+                }
+                throw new Error(error.message);
+            }
+
+            const userData = response.data.data.user;
+            if (!userData) {
+                throw new Error(`User '${username}' not found on GitHub`);
+            }
+
+            const repos = userData.repositories.nodes.map(repo => ({
+                name: repo.name,
+                description: repo.description,
+                created_at: repo.createdAt,
+                updated_at: repo.updatedAt,
+                stargazers_count: repo.stargazerCount,
+                forks_count: repo.forkCount,
+                fork: repo.isFork,
+                private: repo.isPrivate,
+                language: repo.primaryLanguage?.name,
+                languages: repo.languages.edges.reduce((acc, edge) => {
+                    acc[edge.node.name] = edge.size;
+                    return acc;
+                }, {}),
+                topics: repo.repositoryTopics.nodes.map(t => t.topic.name),
+                commits: repo.defaultBranchRef?.target?.history?.totalCount || 0,
+                size: repo.diskUsage || 0,
+                html_url: repo.url
+            }));
+
+            allRepos = [...allRepos, ...repos];
+            hasNextPage = userData.repositories.pageInfo.hasNextPage;
+            after = userData.repositories.pageInfo.endCursor;
+
+            // Store user info for later use
+            if (allRepos.length === repos.length) {
+                cache.set(`user_${username}`, {
+                    username: userData.login,
+                    name: userData.name,
+                    bio: userData.bio,
+                    location: userData.location,
+                    company: userData.company,
+                    blog: userData.websiteUrl,
+                    followers: userData.followers.totalCount,
+                    following: userData.following.totalCount,
+                    avatar: userData.avatarUrl,
+                    joinedDate: userData.createdAt
+                }, 7200);
+            }
+        }
+
+        console.log(`✅ Fetched ${allRepos.length} repositories for ${username}`);
+        cache.set(cacheKey, allRepos, 1800);
+        return allRepos;
+
+    } catch (error) {
+        console.error(`❌ GraphQL fetch error for ${username}:`, error.message);
+        throw error;
+    }
+}
+
+// Configuration constants - Smart defaults for optimal analysis
+const ANALYSIS_CONFIG = {
+    MAX_REPOS: 100,        // Analyze up to 100 repos for comprehensive coverage
+    EXCLUDE_FORKS: true,   // Focus on original work, not forked repos
+    TOP_REPOS_LIMIT: 10    // Show top 10 repositories in results
+};
+
+// Main analysis endpoint - Simplified to just need username
+app.post('/analyze/:username', async (req, res) => {
+    const { username } = req.params;
+
+    const cacheKey = `analysis_${username}_${ANALYSIS_CONFIG.MAX_REPOS}_${ANALYSIS_CONFIG.EXCLUDE_FORKS}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        return res.json({ ...cached, fromCache: true });
+    }
+
+    try {
+        console.log(`🚀 Starting analysis for: ${username}`);
+        const startTime = Date.now();
+
+        const allRepos = await getUserReposGraphQL(username, ANALYSIS_CONFIG.MAX_REPOS);
+
+        if (allRepos.length === 0) {
+            return res.status(404).json({
+                error: 'No repositories found for this user'
+            });
+        }
+
+        // Filter repositories based on configuration
+        const filteredRepos = ANALYSIS_CONFIG.EXCLUDE_FORKS ?
+            allRepos.filter(repo => !repo.fork) : allRepos;
+
+        // Aggregate languages
+        const allLanguages = {};
+        filteredRepos.forEach(repo => {
+            Object.entries(repo.languages || {}).forEach(([lang, bytes]) => {
+                allLanguages[lang] = (allLanguages[lang] || 0) + bytes;
+            });
+        });
+
+        // Convert to percentage format
+        const totalBytes = Object.values(allLanguages).reduce((a, b) => a + b, 0);
+        const languagesFormatted = Object.entries(allLanguages)
+            .sort((a, b) => b[1] - a[1])
+            .reduce((obj, [lang, bytes]) => {
+                obj[lang] = {
+                    bytes,
+                    percentage: totalBytes > 0 ? ((bytes / totalBytes) * 100).toFixed(1) : '0.0'
+                };
+                return obj;
+            }, {});
+
+        const userInfo = cache.get(`user_${username}`) || {};
+
+        const analysis = {
+            user: username,
+            userInfo,
+            summary: {
+                totalRepositories: allRepos.length,
+                analyzedRepositories: filteredRepos.length,
+                forkedRepositories: allRepos.filter(r => r.fork).length,
+                totalLanguages: Object.keys(allLanguages).length,
+                totalStars: filteredRepos.reduce((sum, repo) => sum + repo.stargazers_count, 0),
+                totalCommits: filteredRepos.reduce((sum, repo) => sum + repo.commits, 0),
+            },
+            languages: languagesFormatted,
+            topRepositories: filteredRepos
+                .sort((a, b) => b.stargazers_count - a.stargazers_count)
+                .slice(0, ANALYSIS_CONFIG.TOP_REPOS_LIMIT)
+                .map(repo => ({
+                    name: repo.name,
+                    description: repo.description,
+                    language: repo.language,
+                    stars: repo.stargazers_count,
+                    commits: repo.commits,
+                    url: repo.html_url
+                })),
+            performance: {
+                executionTime: `${Date.now() - startTime}ms`,
+                repositoriesAnalyzed: filteredRepos.length,
+                cacheHit: false
+            },
+            generatedAt: new Date().toISOString()
+        };
+
+        cache.set(cacheKey, analysis, 1800);
+        console.log(`✅ Analysis completed in ${Date.now() - startTime}ms`);
+
+        res.json(analysis);
+
+    } catch (error) {
+        console.error(`❌ Analysis error for ${username}:`, error.message);
+        
+        // Better error messages for users
+        let errorMessage = 'Failed to analyze user';
+        let statusCode = 500;
+        
+        if (error.message.includes('not found')) {
+            errorMessage = `GitHub user '${username}' not found`;
+            statusCode = 404;
+        } else if (error.message.includes('authentication failed')) {
+            errorMessage = 'GitHub API authentication failed. Please contact the administrator.';
+            statusCode = 503;
+        } else if (error.message.includes('rate limit')) {
+            errorMessage = 'GitHub API rate limit exceeded. Please try again later.';
+            statusCode = 429;
+        }
+        
+        res.status(statusCode).json({
+            error: errorMessage,
+            details: error.message,
+            username: username
+        });
+    }
+});
+
+// Simplified GET endpoint - just username needed
+app.get('/analyze/:username', async (req, res) => {
+    const { username } = req.params;
+
+    const cacheKey = `analysis_${username}_${ANALYSIS_CONFIG.MAX_REPOS}_${ANALYSIS_CONFIG.EXCLUDE_FORKS}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+        return res.json({ ...cached, fromCache: true });
+    }
+
+    try {
+        console.log(`🚀 Starting analysis for: ${username} (GET request)`);
+        const startTime = Date.now();
+
+        const allRepos = await getUserReposGraphQL(username, ANALYSIS_CONFIG.MAX_REPOS);
+
+        if (allRepos.length === 0) {
+            return res.status(404).json({
+                error: 'No repositories found for this user'
+            });
+        }
+
+        // Filter repositories based on configuration
+        const filteredRepos = ANALYSIS_CONFIG.EXCLUDE_FORKS ?
+            allRepos.filter(repo => !repo.fork) : allRepos;
+
+        // Aggregate languages
+        const allLanguages = {};
+        filteredRepos.forEach(repo => {
+            Object.entries(repo.languages || {}).forEach(([lang, bytes]) => {
+                allLanguages[lang] = (allLanguages[lang] || 0) + bytes;
+            });
+        });
+
+        // Convert to percentage format
+        const totalBytes = Object.values(allLanguages).reduce((a, b) => a + b, 0);
+        const languagesFormatted = Object.entries(allLanguages)
+            .sort((a, b) => b[1] - a[1])
+            .reduce((obj, [lang, bytes]) => {
+                obj[lang] = {
+                    bytes,
+                    percentage: totalBytes > 0 ? ((bytes / totalBytes) * 100).toFixed(1) : '0.0'
+                };
+                return obj;
+            }, {});
+
+        const userInfo = cache.get(`user_${username}`) || {};
+
+        const analysis = {
+            user: username,
+            userInfo,
+            summary: {
+                totalRepositories: allRepos.length,
+                analyzedRepositories: filteredRepos.length,
+                forkedRepositories: allRepos.filter(r => r.fork).length,
+                totalLanguages: Object.keys(allLanguages).length,
+                totalStars: filteredRepos.reduce((sum, repo) => sum + repo.stargazers_count, 0),
+                totalCommits: filteredRepos.reduce((sum, repo) => sum + repo.commits, 0),
+            },
+            languages: languagesFormatted,
+            topRepositories: filteredRepos
+                .sort((a, b) => b.stargazers_count - a.stargazers_count)
+                .slice(0, ANALYSIS_CONFIG.TOP_REPOS_LIMIT)
+                .map(repo => ({
+                    name: repo.name,
+                    description: repo.description,
+                    language: repo.language,
+                    stars: repo.stargazers_count,
+                    commits: repo.commits,
+                    url: repo.html_url
+                })),
+            performance: {
+                executionTime: `${Date.now() - startTime}ms`,
+                repositoriesAnalyzed: filteredRepos.length,
+                cacheHit: false
+            },
+            generatedAt: new Date().toISOString()
+        };
+
+        cache.set(cacheKey, analysis, 1800);
+        console.log(`✅ Analysis completed in ${Date.now() - startTime}ms`);
+
+        res.json(analysis);
+
+    } catch (error) {
+        console.error(`❌ Analysis error for ${username}:`, error.message);
+        
+        // Better error messages for users
+        let errorMessage = 'Failed to analyze user';
+        let statusCode = 500;
+        
+        if (error.message.includes('not found')) {
+            errorMessage = `GitHub user '${username}' not found`;
+            statusCode = 404;
+        } else if (error.message.includes('authentication failed')) {
+            errorMessage = 'GitHub API authentication failed. Please contact the administrator.';
+            statusCode = 503;
+        } else if (error.message.includes('rate limit')) {
+            errorMessage = 'GitHub API rate limit exceeded. Please try again later.';
+            statusCode = 429;
+        }
+        
+        res.status(statusCode).json({
+            error: errorMessage,
+            details: error.message,
+            username: username
+        });
+    }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        cache: {
+            keys: cache.keys().length
+        }
+    });
+});
+
+// Test endpoint
+app.get('/test/:username', async (req, res) => {
+    const { username } = req.params;
+
+    try {
+        const userInfo = cache.get(`user_${username}`) || 'Not cached';
+        res.json({
+            message: `Test endpoint for ${username}`,
+            userInfo,
+            cacheKeys: cache.keys(),
+            tokenConfigured: !!GITHUB_TOKEN
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+    console.log(`🚀 GitHub Progress Analyzer running on port ${PORT}`);
+    console.log(`🔑 GitHub token: ${GITHUB_TOKEN ? '✅ Configured' : '❌ Missing'}`);
+    console.log(`📊 Simple API usage:`);
+    console.log(`   GET  http://localhost:${PORT}/health`);
+    console.log(`   GET  http://localhost:${PORT}/test/octocat`);
+    console.log(`   GET  http://localhost:${PORT}/analyze/octocat`);
+    console.log(`   POST http://localhost:${PORT}/analyze/octocat`);
+    console.log(`\n⚙️  Analysis settings: ${ANALYSIS_CONFIG.MAX_REPOS} repos max, ${ANALYSIS_CONFIG.EXCLUDE_FORKS ? 'excluding' : 'including'} forks`);
+    console.log(`\n🌐 Your API is ready! Anyone can analyze public GitHub profiles using your token.`);
+    console.log(`💡 Users just need to provide a GitHub username - no authentication required on their end.`);
+});
