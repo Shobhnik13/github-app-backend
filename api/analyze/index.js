@@ -1,3 +1,4 @@
+const { analyzePatterns, generateInsights } = require('../../utils/functions');
 const {
     resetApiCallCount,
     getApiCallCount,
@@ -5,9 +6,7 @@ const {
     fetchRepos,
     fetchLanguages,
     fetchCommitCount
-} = require('../lib/github');
-
-const { analyzePatterns, generateInsights } = require('../utils/functions');
+} = require('../../lib/github');
 
 
 module.exports = async function handler(req, res) {
