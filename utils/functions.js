@@ -22,7 +22,7 @@ function generateInsights(repos, langs, patterns) {
     const topLangEntry = Object.entries(langs).sort((a, b) => b[1] - a[1])[0];
     if (topLangEntry) {
         const [topLang, bytes] = topLangEntry;
-        const linesApprox = Math.floor(bytes / 50); // crude approx lines from bytes
+        const linesApprox = Math.floor(bytes / 30);
         insights.push(`Top Language: ${topLang} (~${linesApprox.toLocaleString()} lines of code!)`);
     }
 
@@ -52,13 +52,26 @@ function generateInsights(repos, langs, patterns) {
         }
     }
 
-    const largestRepo = repos.reduce((max, r) => (r.size > max.size ? r : max), repos[0]);
+    const nonForkedRepos = repos.filter(rep => !rep.fork)
+    const largestRepo = nonForkedRepos.reduce((max, r) => (r.size > max.size ? r : max), repos[0]);
     if (largestRepo && largestRepo.size > 1024 * 50) {
         insights.push(`Big Project Alert! Your largest repo (${largestRepo.name}) is over 50 MB — substantial work!`);
     }
 
     if (totalStars === 0) {
         insights.push('Quiet Achiever — stars don’t tell the whole story, keep rocking!');
+    }
+
+    if (forked > 0) {
+        insights.push(`You've forked ${forked} repositories — a sign of exploring and learning from open source.`);
+        if (forked >= 10) {
+            insights.push('Active Open Source Explorer — you’ve forked 10+ repos, which shows strong interest in open collaboration!');
+        }
+    }
+
+    const ownForkedRepos = repos.filter(r => !r.fork && r.forks_count > 5);
+    if (ownForkedRepos.length > 0) {
+        insights.push(`Open Source Contributor — ${ownForkedRepos.length} of your repos have been forked more than 5 times!`);
     }
 
     return insights;

@@ -7,6 +7,7 @@ const {
     fetchLanguages,
     fetchCommitCount
 } = require('../../lib/github');
+const { redis } = require('../../lib/redis');
 
 
 module.exports = async function handler(req, res) {
@@ -24,25 +25,35 @@ module.exports = async function handler(req, res) {
     const startTime = Date.now();
 
     console.log(`Starting analysis for: ${username}`);
-
+    const cachekey = `github:analysis:${username}`
     try {
-        const [userInfo, repos] = await Promise.all([
-            fetchUserInfo(username),
-            fetchRepos(username)
-        ]);
-
-        if (!userInfo) {
-            console.log('User not found or failed to fetch user info');
-            return res.status(404).json({ error: 'User not found or failed to fetch user info.' });
+        const cachedData = await redis.get(cachekey)
+        if (cachedData) {
+            console.log(`cache hit for ${cachekey}`);
+            return res.status(200).json(JSON.parse(cachedData));
         }
+
+        const userInfo = await fetchUserInfo(username);
+        if (!userInfo) {
+            console.log(`User not found: ${username}`);
+            return res.status(404).json({
+                error: 'GitHub user not found.',
+                user: username,
+                status: 'user_not_found'
+            });
+        }
+
+        const repos = await fetchRepos(username);
 
         if (!repos.length) {
             console.log('No repos found');
-            return res.status(404).json({ error: 'No repositories found for this user.' });
+            return res.status(404).json({ error: 'No public repositories found for this user.' });
         }
 
         const originals = repos.filter(r => !r.fork);
-        const top20 = originals.slice(0, 20);
+        const top20 = originals
+            .sort((a, b) => b.stargazers_count - a.stargazers_count)
+            .slice(0, 20);
 
         console.log(`Analyzing top ${top20.length} original repos`);
 
@@ -73,11 +84,12 @@ module.exports = async function handler(req, res) {
         const patterns = analyzePatterns(repos);
         const insights = generateInsights(repos, allLangs, patterns);
 
+
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
         console.log(`Analysis complete in ${duration}s`);
         console.log(`Total GitHub API calls: ${getApiCallCount()}`);
 
-        return res.status(200).json({
+        const result = {
             userInfo,
             user: username,
             summary: {
@@ -94,7 +106,14 @@ module.exports = async function handler(req, res) {
                 githubApiCalls: getApiCallCount(),
                 analysisTimeSeconds: duration
             }
-        });
+        };
+        // caache
+        const setData = await redis.set(cachekey, JSON.stringify(result), 'EX', 2 * 60 * 60)
+        if (setData) {
+            console.log(`cache set for ${cachekey}`);
+        }
+
+        return res.status(200).json(result);
     } catch (err) {
         console.error(`Error: ${err.message}`);
         return res.status(500).json({ error: 'Failed to analyze user.', message: err.message });
