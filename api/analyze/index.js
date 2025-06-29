@@ -52,9 +52,15 @@ module.exports = async function handler(req, res) {
 
         const originals = repos.filter(r => !r.fork);
         const top20 = originals
-            .sort((a, b) => b.stargazers_count - a.stargazers_count)
+            .sort((a, b) => {
+                // If stars are the same like out of 50 total repos 3 have stars so they will get at top acc to stars but rest 47 2 have same stars so future or recent cretaed will be at top rest 45 are arranged basis of recent creation date, sort by creation date (newest first)
+                if (b.stargazers_count === a.stargazers_count) {
+                    return new Date(b.created_at) - new Date(a.created_at);
+                }
+                return b.stargazers_count - a.stargazers_count;
+            })
             .slice(0, 20);
-
+            
         console.log(`Analyzing top ${top20.length} original repos`);
 
         const detailed = await Promise.all(top20.map(async repo => {
