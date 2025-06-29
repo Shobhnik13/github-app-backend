@@ -123,7 +123,7 @@ module.exports = async function handler(req, res) {
             }
         };
         // caache
-        const setData = await redis.set(cachekey, JSON.stringify(result), 'EX', 2 * 60 * 60)
+        const setData = await redis.set(cachekey, JSON.stringify(result), 'EX', 1 * 60 * 60)
         if (setData) {
             console.log(`cache set for ${cachekey}`);
         }
