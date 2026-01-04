@@ -1,13 +1,13 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const analyzeHandler = require('./api/analyze/index.js');
+const githubAnalysisController = require('./controllers/analyzer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.post('/api/analyze', analyzeHandler);
+app.post('/api/analyze', githubAnalysisController);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
